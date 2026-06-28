@@ -1,0 +1,371 @@
+---
+title: "Estudio estadístico STL simetría — Comparativa entre arquitecturas"
+subtitle: "TFG: clasificación de lesiones cutáneas (HAM10000)"
+author: "Maria del Mar Tauler"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  comment = "",
+  fig.align = "center"
+)
+```
+
+# Introducción
+
+Este documento implementa el **paso 1** del estudio estadístico descrito en
+el documento teórico: la comparativa entre los **5 modelos STL de simetría**
+(VGG16, ResNet50, MobileNetV2, DenseNet169, U-Net).
+
+## Procedimiento
+
+Para cada pareja de modelos $(j, k)$:
+
+1. Calculamos $\Delta = F1_{macro,j} - F1_{macro,k}$ observado.
+2. Construimos un **intervalo de confianza BCa estratificado** por la clase
+   verdadera, mediante bootstrap con $B = 2000$ réplicas.
+3. **Contraste bilateral** al $1-\alpha' = 99.5\%$: si $0 \notin IC$ los modelos son significativamente
+   diferentes.
+4. Si lo son, aplicamos el **contraste unilateral** construyendo un IC bilateral al $1-2\alpha' = 99\%$
+   y usando solo el límite inferior (equivalencia sección 2.4 del PDF): si $L > 0$ gana el modelo $j$;
+   si $U < 0$ gana el modelo $k$.
+
+## Corrección de Bonferroni
+
+Hay $K = \binom{5}{2} = 10$ comparaciones, así que aplicamos Bonferroni con
+$\alpha' = \alpha / K = 0.05/10 = 0.005$.
+
+# Configuración
+
+```{r librerias}
+# Si no las tienes instaladas:
+# install.packages(c("boot", "MLmetrics", "dplyr", "knitr"))
+library(boot)
+library(MLmetrics)
+library(knitr)
+```
+
+```{r config}
+# Ruta de la carpeta con los CSVs (ajústala a tu sistema)
+DATA_DIR <- "~/Desktop/TFG_R/R_STL_symmetry"
+
+ALPHA_GLOBAL    <- 0.05
+N_MODELS        <- 5
+K_PAIRS         <- choose(N_MODELS, 2)        # = 10
+ALPHA_ADJ       <- ALPHA_GLOBAL / K_PAIRS     # = 0.005
+CONF_BILATERAL  <- 1 - ALPHA_ADJ              # = 0.995 (99.5%) — contraste bilateral
+CONF_UNILATERAL <- 1 - 2 * ALPHA_ADJ          # = 0.990 (99%)   — contraste unilateral
+B               <- 2000                       # réplicas bootstrap
+
+cat("Bonferroni: K =", K_PAIRS, "→ α' =", ALPHA_ADJ, "\n")
+cat("IC bilateral al",  100 * CONF_BILATERAL,  "% (contraste bilateral)\n")
+cat("IC unilateral al", 100 * CONF_UNILATERAL, "% (contraste unilateral)\n")
+cat("B =", B, "réplicas bootstrap (estratificadas por clase)\n")
+```
+
+# Carga de datos
+
+```{r cargar_csvs}
+csv_files <- list.files(DATA_DIR, pattern = "^predictions_STL_.*_symmetry.*\\.csv$",
+                         full.names = TRUE)
+
+get_arch <- function(filepath) {
+  fname <- basename(filepath)
+  sub("^predictions_STL_(.+?)_symmetry.*$", "\\1", fname)
+}
+
+predictions <- list()
+for (f in csv_files) {
+  arch <- get_arch(f)
+  predictions[[arch]] <- read.csv(f, stringsAsFactors = FALSE)
+}
+
+archs <- names(predictions)
+cat("Modelos cargados:", paste(archs, collapse = ", "), "\n")
+```
+
+```{r f1_observado}
+todas_clases <- c("2_ejes","1_eje","asimetrica")
+
+# Función auxiliar: F1-macro manual (promedio simple de los F1 por clase)
+f1_macro <- function(y_true, y_pred, clases) {
+  f1_per_class <- sapply(clases, function(cl) {
+    tp <- sum(y_pred == cl & y_true == cl)
+    fp <- sum(y_pred == cl & y_true != cl)
+    fn <- sum(y_pred != cl & y_true == cl)
+    if (tp == 0) return(0)
+    prec <- tp / (tp + fp)
+    rec  <- tp / (tp + fn)
+    2 * prec * rec / (prec + rec)
+  })
+  mean(f1_per_class)
+}
+
+f1_obs <- sapply(archs, function(a) {
+  f1_macro(predictions[[a]]$true_label,
+           predictions[[a]]$pred_label, todas_clases)
+})
+f1_obs <- as.numeric(f1_obs)
+names(f1_obs) <- archs
+
+print(f1_obs)   # debería darte 5 valores numéricos entre 0 y 1
+
+kable(
+  data.frame(
+    Modelo               = archs,
+    `F1-macro observado` = round(f1_obs, 4),
+    `N imágenes test`    = sapply(archs, function(a) nrow(predictions[[a]])),
+    check.names = FALSE
+  ),
+  caption = "F1-macro observado de cada modelo STL de simetría en el test set"
+)
+```
+
+## Verificación de consistencia de los CSVs
+
+```{r verificar_ids}
+ref_ids <- predictions[[1]]$image_id
+todos_iguales <- all(sapply(archs[-1], function(a) {
+  identical(predictions[[a]]$image_id, ref_ids)
+}))
+
+if (todos_iguales) {
+  cat("✓ Los image_id coinciden entre los", length(archs), "modelos\n")
+} else {
+  stop("Los image_id NO coinciden entre los modelos. Hay que arreglarlo.")
+}
+```
+
+# Construcción del dataframe maestro
+
+Una fila por imagen, con la clase verdadera y las predicciones de cada modelo.
+
+```{r df_master}
+df_master <- data.frame(
+  image_id   = predictions[[1]]$image_id,
+  true_label = predictions[[1]]$true_label,
+  stringsAsFactors = FALSE
+)
+for (a in archs) {
+  df_master[[paste0("pred_", a)]] <- predictions[[a]]$pred_label
+}
+df_master$strata <- df_master$true_label   # estratificación bootstrap
+
+cat("DataFrame:", nrow(df_master), "filas,", ncol(df_master), "columnas\n")
+head(df_master)
+```
+
+# Comparaciones por parejas — Bootstrap BCa
+
+```{r funcion_delta}
+# F1-macro manual (calculado con bucle for, sin ambigüedad de scope)
+f1_macro <- function(y_true, y_pred, clases_pos) {
+  f1_vals <- numeric(length(clases_pos))
+  for (i in seq_along(clases_pos)) {
+    cl <- clases_pos[i]
+    tp <- sum(y_pred == cl & y_true == cl)
+    fp <- sum(y_pred == cl & y_true != cl)
+    fn <- sum(y_pred != cl & y_true == cl)
+    if (tp == 0) {
+      f1_vals[i] <- 0
+    } else {
+      prec <- tp / (tp + fp)
+      rec  <- tp / (tp + fn)
+      f1_vals[i] <- 2 * prec * rec / (prec + rec)
+    }
+  }
+  mean(f1_vals)
+}
+
+# Función generadora: devuelve una función que calcula ΔF1 = F1(j) - F1(k)
+make_delta_f1_fn <- function(model_j, model_k) {
+  col_j <- paste0("pred_", model_j)
+  col_k <- paste0("pred_", model_k)
+  function(data, indices) {
+    d <- data[indices, ]
+    f1_j <- f1_macro(d$true_label, d[[col_j]], todas_clases)
+    f1_k <- f1_macro(d$true_label, d[[col_k]], todas_clases)
+    f1_j - f1_k
+  }
+}
+```
+
+```{r bootstrap_pares}
+# IC por BCa estimando la aceleracion con el jackknife (influencia leave-one-out),
+# que es la forma original y mas estable. La influencia por regresion que usa
+# boot.ci por defecto daba 'a'=NA con muestreo estratificado y muchas replicas.
+# Si ni con el jackknife es estimable, cae al percentil y lo anota.
+get_ci <- function(boot_res, conf, L = NULL) {
+  res <- tryCatch(boot.ci(boot_res, type = "bca", conf = conf, L = L),
+                  error = function(e) NULL)
+  if (!is.null(res) && !is.null(res$bca) && !any(is.na(res$bca[1, 4:5]))) {
+    return(list(L = res$bca[1, 4], U = res$bca[1, 5], metodo = "BCa"))
+  }
+  res <- boot.ci(boot_res, type = "perc", conf = conf)
+  list(L = res$percent[1, 4], U = res$percent[1, 5], metodo = "percentil")
+}
+
+results <- data.frame(
+  model_j     = character(),
+  model_k     = character(),
+  delta_obs   = numeric(),
+  IC_bil_low  = numeric(),
+  IC_bil_high = numeric(),
+  IC_uni_low  = numeric(),
+  diferentes  = logical(),
+  ganador     = character(),
+  metodo_IC   = character(),
+  stringsAsFactors = FALSE
+)
+
+pairs_list <- combn(archs, 2, simplify = FALSE)
+
+for (p in pairs_list) {
+  mj <- p[1]; mk <- p[2]
+  
+  stat_fn   <- make_delta_f1_fn(mj, mk)
+  delta_obs <- stat_fn(df_master, seq_len(nrow(df_master)))
+  
+  set.seed(2026)   # dentro del bucle para reproducibilidad por pareja
+  boot_res <- boot(
+    data      = df_master,
+    statistic = stat_fn,
+    R         = B,
+    strata    = factor(df_master$strata)
+  )
+
+  # Aceleracion BCa por jackknife (mas estable que la influencia por defecto)
+  L_jack <- tryCatch(empinf(boot_res, type = "jack"), error = function(e) NULL)
+
+  # Contraste bilateral al 99.5% (= 1 - α')
+  ci_bil <- get_ci(boot_res, CONF_BILATERAL, L = L_jack)
+  L_bil  <- ci_bil$L
+  U_bil  <- ci_bil$U
+  son_diferentes <- !(L_bil <= 0 && 0 <= U_bil)
+  
+  # Contraste unilateral al 99.5% (construido como bilateral al 99% = 1 - 2α')
+  if (son_diferentes) {
+    ci_uni <- get_ci(boot_res, CONF_UNILATERAL, L = L_jack)
+    L_uni  <- ci_uni$L
+    U_uni  <- ci_uni$U
+    if (0 < L_uni)       ganador <- mj
+    else if (U_uni < 0)  ganador <- mk
+    else                 ganador <- "indeterminado"
+  } else {
+    ganador <- "empate"
+    L_uni   <- NA
+  }
+  
+  results <- rbind(results, data.frame(
+    model_j     = mj,
+    model_k     = mk,
+    delta_obs   = round(delta_obs, 4),
+    IC_bil_low  = round(L_bil, 4),
+    IC_bil_high = round(U_bil, 4),
+    IC_uni_low  = round(L_uni, 4),
+    diferentes  = son_diferentes,
+    ganador     = ganador,
+    metodo_IC   = ci_bil$metodo,
+    stringsAsFactors = FALSE
+  ))
+}
+```
+
+## Tabla de resultados
+
+```{r tabla_results}
+kable(
+  results,
+  caption = paste0("Comparaciones por parejas — IC bilateral BCa al ",
+                    100 * CONF_BILATERAL, "% | IC unilateral al ",
+                    100 * CONF_UNILATERAL, "% (Bonferroni K=", K_PAIRS, ")"),
+  col.names = c("Modelo j", "Modelo k", "Δ observado",
+                "IC bil. inf", "IC bil. sup",
+                "IC uni. inf",
+                "¿Distintos?", "Ganador", "Método IC")
+)
+```
+
+# Ranking final
+
+```{r ranking}
+wins <- sapply(archs, function(a) sum(results$ganador == a))
+
+ties_per_model <- sapply(archs, function(a) {
+  sum((results$model_j == a | results$model_k == a) &
+        results$ganador == "empate")
+})
+
+losses <- sapply(archs, function(a) {
+  appears   <- (results$model_j == a) | (results$model_k == a)
+  total_apps <- sum(appears)
+  wins_a     <- sum(results$ganador == a)
+  ties_a     <- sum(appears & results$ganador == "empate")
+  total_apps - wins_a - ties_a
+})
+
+ranking <- data.frame(
+  Modelo    = archs,
+  F1_macro  = round(f1_obs, 4),
+  Victorias = wins,
+  Empates   = ties_per_model,
+  Derrotas  = losses
+)
+ranking <- ranking[order(-ranking$Victorias, -ranking$F1_macro), ]
+
+kable(ranking, row.names = FALSE,
+      caption = "Ranking — victorias significativas y F1-macro")
+```
+
+```{r mejor_stl}
+best_stl       <- ranking$Modelo[1]
+best_stl_f1    <- ranking$F1_macro[1]
+best_stl_vic   <- ranking$Victorias[1]
+
+cat("\n══════════════════════════════════════════════════════════\n")
+cat("   MEJOR MODELO STL (simetría):", best_stl, "\n")
+cat("   F1-macro =", best_stl_f1,
+    " | Victorias significativas:", best_stl_vic, "de", N_MODELS - 1, "\n")
+cat("══════════════════════════════════════════════════════════\n")
+```
+
+# Guardar resultados
+
+```{r guardar}
+write.csv(results,
+          file.path(DATA_DIR, "resultados_STL_symmetry_comparaciones.csv"),
+          row.names = FALSE)
+write.csv(ranking,
+          file.path(DATA_DIR, "resultados_STL_symmetry_ranking.csv"),
+          row.names = FALSE)
+
+cat("Resultados guardados en:\n")
+cat("  -", file.path(DATA_DIR, "resultados_STL_symmetry_comparaciones.csv"), "\n")
+cat("  -", file.path(DATA_DIR, "resultados_STL_symmetry_ranking.csv"), "\n")
+```
+
+# Interpretación
+
+- El IC **bilateral** está construido al **`r 100*CONF_BILATERAL`%** ($= 1-\alpha'$, Bonferroni $K = `r K_PAIRS`$).
+- El IC **unilateral** está construido como bilateral al **`r 100*CONF_UNILATERAL`%** ($= 1-2\alpha'$) y se usa solo el límite inferior, que equivale a un unilateral al $1-\alpha' = `r 100*CONF_BILATERAL`\%$ (sección 2.4 del PDF).
+- Si $0 \in IC$, no hay evidencia estadística para concluir que los rendimientos
+  sean distintos (empate).
+- Si $0 \notin IC$, el modelo cuyo $\Delta$ tiene signo coherente con el
+  límite que excluye a $0$ es **significativamente mejor**.
+- El **mejor modelo STL de simetría** según este criterio es **`r best_stl`**.
+
+Este resultado identifica la arquitectura monotarea más adecuada para la tarea de simetría.

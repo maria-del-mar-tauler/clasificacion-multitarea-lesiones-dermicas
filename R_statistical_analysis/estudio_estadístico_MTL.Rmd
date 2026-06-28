@@ -1,0 +1,314 @@
+---
+title: "Estudio estadístico MTL - Comparativa entre arquitecturas"
+subtitle: "TFG: clasificación de lesiones cutáneas (HAM10000)"
+author: "Maria del Mar Tauler"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  comment = "",
+  fig.align = "center"
+)
+```
+
+# Introducción
+
+Este documento implementa el **paso 2** del estudio estadístico: la comparativa
+entre los **5 modelos MTL** (VGG16, ResNet50, MobileNetV2, DenseNet169, U-Net),
+evaluando únicamente la salida `head_disease` (diagnóstico de 7 clases).
+
+El procedimiento es exactamente el mismo que en el paso 1 (STL):
+
+- Para cada pareja $(j, k)$: $\Delta = F1_{macro,j} - F1_{macro,k}$
+- Intervalo de confianza BCa bootstrap estratificado por clase, $B = 2000$
+- Corrección de Bonferroni con $K = \binom{5}{2} = 10$ comparaciones
+- $\alpha' = 0.05/10 = 0.005$ → IC bilateral al $1-\alpha' = 99.5\%$ y IC unilateral construido al $1-2\alpha' = 99\%$
+
+# Configuración
+
+```{r librerias}
+library(boot)
+library(knitr)
+```
+
+```{r config}
+DATA_DIR <- "~/Desktop/TFG_R/R_MTL"
+
+ALPHA_GLOBAL    <- 0.05
+N_MODELS        <- 5
+K_PAIRS         <- choose(N_MODELS, 2)        # = 10
+ALPHA_ADJ       <- ALPHA_GLOBAL / K_PAIRS     # = 0.005
+CONF_BILATERAL  <- 1 - ALPHA_ADJ              # = 0.995 (99.5%) - contraste bilateral
+CONF_UNILATERAL <- 1 - 2 * ALPHA_ADJ          # = 0.990 (99%)   - contraste unilateral
+B               <- 2000
+
+todas_clases   <- c("akiec","bcc","bkl","df","mel","nv","vasc")
+
+cat("Bonferroni: K =", K_PAIRS, "→ α' =", ALPHA_ADJ, "\n")
+cat("IC bilateral al",  100 * CONF_BILATERAL,  "% (contraste bilateral)\n")
+cat("IC unilateral al", 100 * CONF_UNILATERAL, "% (contraste unilateral)\n")
+cat("B =", B, "réplicas bootstrap (estratificadas por clase)\n")
+```
+
+# Carga de datos MTL
+
+```{r cargar_csvs}
+csv_files <- list.files(DATA_DIR, pattern = "^predictions_MTL_.*\\.csv$",
+                         full.names = TRUE)
+
+get_arch <- function(filepath) {
+  fname <- basename(filepath)
+  sub("^predictions_MTL_(.+?)_FASE2\\.csv$", "\\1", fname)
+}
+
+predictions <- list()
+for (f in csv_files) {
+  arch <- get_arch(f)
+  predictions[[arch]] <- read.csv(f, stringsAsFactors = FALSE)
+}
+
+archs <- names(predictions)
+cat("Modelos MTL cargados:", paste(archs, collapse = ", "), "\n")
+```
+
+# F1-macro observado
+
+```{r f1_macro_def}
+
+f1_macro <- function(y_true, y_pred, clases_pos) {
+  f1_vals <- numeric(length(clases_pos))
+  for (i in seq_along(clases_pos)) {
+    cl <- clases_pos[i]
+    tp <- sum(y_pred == cl & y_true == cl)
+    fp <- sum(y_pred == cl & y_true != cl)
+    fn <- sum(y_pred != cl & y_true == cl)
+    if (tp == 0) {
+      f1_vals[i] <- 0
+    } else {
+      prec <- tp / (tp + fp)
+      rec  <- tp / (tp + fn)
+      f1_vals[i] <- 2 * prec * rec / (prec + rec)
+    }
+  }
+  mean(f1_vals)
+}
+```
+
+```{r f1_observado}
+f1_obs <- sapply(archs, function(a) {
+  f1_macro(predictions[[a]]$disease_true,
+           predictions[[a]]$disease_pred, todas_clases)
+})
+f1_obs <- as.numeric(f1_obs)
+names(f1_obs) <- archs
+
+print(f1_obs)
+
+kable(
+  data.frame(
+    Modelo               = archs,
+    `F1-macro observado` = round(f1_obs, 4),
+    `N imágenes test`    = sapply(archs, function(a) nrow(predictions[[a]])),
+    check.names = FALSE
+  ),
+  caption = "F1-macro observado de cada modelo MTL (head_disease) en el test set"
+)
+```
+
+## Verificación de consistencia
+
+```{r verificar_ids}
+ref_ids <- predictions[[1]]$image_id
+todos_iguales <- all(sapply(archs[-1], function(a) {
+  identical(predictions[[a]]$image_id, ref_ids)
+}))
+
+if (todos_iguales) {
+  cat("Los image_id coinciden entre los", length(archs), "modelos MTL\n")
+} else {
+  stop("Los image_id NO coinciden entre los modelos MTL.")
+}
+```
+
+# Construcción del dataframe maestro
+
+```{r df_master}
+df_master <- data.frame(
+  image_id   = predictions[[1]]$image_id,
+  true_label = predictions[[1]]$disease_true,
+  stringsAsFactors = FALSE
+)
+for (a in archs) {
+  df_master[[paste0("pred_", a)]] <- predictions[[a]]$disease_pred
+}
+df_master$strata <- df_master$true_label
+
+cat("DataFrame MTL:", nrow(df_master), "filas,", ncol(df_master), "columnas\n")
+head(df_master)
+```
+
+# Función bootstrap
+
+```{r funcion_delta}
+make_delta_f1_fn <- function(model_j, model_k) {
+  col_j <- paste0("pred_", model_j)
+  col_k <- paste0("pred_", model_k)
+  function(data, indices) {
+    d <- data[indices, ]
+    f1_j <- f1_macro(d$true_label, d[[col_j]], todas_clases)
+    f1_k <- f1_macro(d$true_label, d[[col_k]], todas_clases)
+    f1_j - f1_k
+  }
+}
+```
+
+# Comparaciones por parejas
+
+```{r bootstrap_pares}
+results <- data.frame(
+  model_j     = character(),
+  model_k     = character(),
+  delta_obs   = numeric(),
+  IC_bil_low  = numeric(),
+  IC_bil_high = numeric(),
+  IC_uni_low  = numeric(),
+  diferentes  = logical(),
+  ganador     = character(),
+  stringsAsFactors = FALSE
+)
+
+pairs_list <- combn(archs, 2, simplify = FALSE)
+
+for (p in pairs_list) {
+  mj <- p[1]; mk <- p[2]
+  
+  stat_fn   <- make_delta_f1_fn(mj, mk)
+  delta_obs <- stat_fn(df_master, seq_len(nrow(df_master)))
+  
+  set.seed(2026)   # dentro del bucle para reproducibilidad por pareja
+  boot_res <- boot(
+    data      = df_master,
+    statistic = stat_fn,
+    R         = B,
+    strata    = factor(df_master$strata)
+  )
+  
+  # Contraste bilateral al 99.5% (= 1 - α')
+  ci_bil <- boot.ci(boot_res, type = "bca", conf = CONF_BILATERAL)
+  L_bil  <- ci_bil$bca[1, 4]
+  U_bil  <- ci_bil$bca[1, 5]
+  son_diferentes <- !(L_bil <= 0 && 0 <= U_bil)
+  
+  # Contraste unilateral al 99.5% (construido como bilateral al 99% = 1 - 2α')
+  if (son_diferentes) {
+    ci_uni <- boot.ci(boot_res, type = "bca", conf = CONF_UNILATERAL)
+    L_uni  <- ci_uni$bca[1, 4]
+    U_uni  <- ci_uni$bca[1, 5]
+    if (0 < L_uni)       ganador <- mj
+    else if (U_uni < 0)  ganador <- mk
+    else                 ganador <- "indeterminado"
+  } else {
+    ganador <- "empate"
+    L_uni   <- NA
+  }
+  
+  results <- rbind(results, data.frame(
+    model_j     = mj,
+    model_k     = mk,
+    delta_obs   = round(delta_obs, 4),
+    IC_bil_low  = round(L_bil, 4),
+    IC_bil_high = round(U_bil, 4),
+    IC_uni_low  = round(L_uni, 4),
+    diferentes  = son_diferentes,
+    ganador     = ganador,
+    stringsAsFactors = FALSE
+  ))
+}
+```
+
+## Tabla de resultados
+
+```{r tabla_results}
+kable(
+  results,
+  caption = paste0("Comparaciones por parejas MTL - IC bilateral BCa al ",
+                    100 * CONF_BILATERAL, "% | IC unilateral al ",
+                    100 * CONF_UNILATERAL, "% (Bonferroni K=", K_PAIRS, ")"),
+  col.names = c("Modelo j", "Modelo k", "Δ observado",
+                "IC bil. inf", "IC bil. sup",
+                "IC uni. inf",
+                "¿Distintos?", "Ganador")
+)
+```
+
+# Ranking final
+
+```{r ranking}
+wins <- sapply(archs, function(a) sum(results$ganador == a))
+
+ties_per_model <- sapply(archs, function(a) {
+  sum((results$model_j == a | results$model_k == a) &
+        results$ganador == "empate")
+})
+
+losses <- sapply(archs, function(a) {
+  appears   <- (results$model_j == a) | (results$model_k == a)
+  total_apps <- sum(appears)
+  wins_a     <- sum(results$ganador == a)
+  ties_a     <- sum(appears & results$ganador == "empate")
+  total_apps - wins_a - ties_a
+})
+
+ranking <- data.frame(
+  Modelo    = archs,
+  F1_macro  = round(f1_obs, 4),
+  Victorias = wins,
+  Empates   = ties_per_model,
+  Derrotas  = losses
+)
+ranking <- ranking[order(-ranking$Victorias, -ranking$F1_macro), ]
+
+kable(ranking, row.names = FALSE,
+      caption = "Ranking MTL - victorias significativas y F1-macro")
+```
+
+
+
+# Guardar resultados
+
+```{r guardar}
+write.csv(results,
+          file.path(DATA_DIR, "resultados_MTL_comparaciones.csv"),
+          row.names = FALSE)
+write.csv(ranking,
+          file.path(DATA_DIR, "resultados_MTL_ranking.csv"),
+          row.names = FALSE)
+
+cat("Resultados guardados en:\n")
+cat("  -", file.path(DATA_DIR, "resultados_MTL_comparaciones.csv"), "\n")
+cat("  -", file.path(DATA_DIR, "resultados_MTL_ranking.csv"), "\n")
+```
+
+# Interpretación
+
+- El IC **bilateral** está construido al **`r 100*CONF_BILATERAL`%** ($= 1-\alpha'$, Bonferroni $K = `r K_PAIRS`$).
+- El IC **unilateral** está construido como bilateral al **`r 100*CONF_UNILATERAL`%** ($= 1-2\alpha'$) y se usa solo el límite inferior, que equivale a un unilateral al $1-\alpha' = `r 100*CONF_BILATERAL`\%$.
+- Si $0 \in IC$, no hay evidencia estadística para concluir que los rendimientos
+  sean distintos (empate).
+- Si $0 \notin IC$, el modelo con $\Delta$ del signo correcto es
+  **significativamente mejor**.
+
